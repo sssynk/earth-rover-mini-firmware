@@ -1,0 +1,12 @@
+# Build artifact — rebuild with: GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build .
+robot_app
+
+# Per-device credentials — never commit
+*.env
+robot_app.env
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
