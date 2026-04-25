@@ -21,6 +21,80 @@ import (
 	"time"
 )
 
+// spawnTailscaled forks tailscaled as a fully-detached child if it's not
+// already running. Same SysProcAttr.Setsid trick we use for self-daemonization.
+// Idempotent: if a tailscaled is already alive on the control socket, no-op.
+func spawnTailscaled(binPath, stateDir, socket, logPath string) {
+	// Idempotency check: if `tailscale status` against the socket succeeds,
+	// tailscaled is already up and we don't need to start it again.
+	if err := exec.Command(binPath, "--socket="+socket, "status", "--peers=false").Run(); err == nil {
+		log.Printf("tailscaled already running, not respawning")
+		return
+	}
+
+	logF, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("tailscaled: open log: %v", err)
+		return
+	}
+	null, _ := os.Open(os.DevNull)
+	tsdPath := "/userdata/tailscaled" // sibling of tailscale binary
+	cmd := exec.Command(tsdPath,
+		"--tun=userspace-networking",
+		"--statedir="+stateDir,
+		"--socket="+socket,
+		"--port=41641",
+	)
+	cmd.Stdin = null
+	cmd.Stdout = logF
+	cmd.Stderr = logF
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		log.Printf("tailscaled: start: %v", err)
+		return
+	}
+	log.Printf("spawned tailscaled pid %d (logs in %s)", cmd.Process.Pid, logPath)
+	_ = cmd.Process.Release() // detach so we don't accumulate zombies
+}
+
+// syncTimeFromHTTP fetches the HTTP Date header from a known public server
+// and sets the system clock with `date -u -s` if our current clock looks wrong
+// (year < 2025). The robot has no NTP and its RTC doesn't survive boot, so
+// time-sensitive workloads (Tailscale TLS, log timestamps) need this on startup.
+func syncTimeFromHTTP() {
+	if time.Now().Year() >= 2025 {
+		return // clock looks plausible
+	}
+	conn, err := net.DialTimeout("tcp", "ifconfig.me:80", 5*time.Second)
+	if err != nil {
+		log.Printf("time sync: dial: %v", err)
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = fmt.Fprintf(conn, "HEAD / HTTP/1.0\r\nHost: ifconfig.me\r\n\r\n")
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(strings.ToLower(line), "date:") {
+			ts := strings.TrimSpace(line[5:])
+			t, err := http.ParseTime(ts)
+			if err != nil {
+				log.Printf("time sync: parse: %v", err)
+				return
+			}
+			out, err := exec.Command("date", "-u", "-s", t.UTC().Format("2006-01-02 15:04:05")).CombinedOutput()
+			if err != nil {
+				log.Printf("time sync: date -s: %v %s", err, out)
+				return
+			}
+			log.Printf("time synced from ifconfig.me: %s", t.UTC().Format(time.RFC3339))
+			return
+		}
+	}
+	log.Printf("time sync: no Date header")
+}
+
 // daemonize re-execs ourselves detached. Parent exits; child continues with
 // stdin=/dev/null, stdout/stderr pointed at the given log file, and a fresh
 // session id so it survives the originating shell.
@@ -260,6 +334,68 @@ func nmeaToDeg(coord, hemi string) float64 {
 }
 
 // -----------------------------------------------------------------------------
+// Fan control — direct MMIO writes via the vendor's `io` tool.
+// Reverse-engineered from frodobot.bin's RestApi::fanCtrl().
+// -----------------------------------------------------------------------------
+
+// setFan toggles the cooling fan on or off. Returns an error if io fails.
+func setFan(on bool) error {
+	var pinmux, gpio string
+	if on {
+		pinmux, gpio = "0x000C0004", "0x03000100"
+	} else {
+		pinmux, gpio = "0x000C0008", "0x03000200"
+	}
+	if err := exec.Command("/usr/bin/io", "-4", "0xFF5381C4", pinmux).Run(); err != nil {
+		return fmt.Errorf("fan pinmux write: %w", err)
+	}
+	if err := exec.Command("/usr/bin/io", "-4", "0xFF5381C0", gpio).Run(); err != nil {
+		return fmt.Errorf("fan gpio write: %w", err)
+	}
+	return nil
+}
+
+// readSoCTempC returns the SoC temperature in degrees C, or 0 on error.
+func readSoCTempC() int {
+	b, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp")
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0
+	}
+	return v / 1000
+}
+
+// runThermalFanLoop polls the SoC temp and toggles the fan with hysteresis.
+// Reports current state to the shared `state` so the HTTP API can expose it.
+func runThermalFanLoop(state *State, onAt, offAt int) {
+	fanOn := false
+	_ = setFan(false)
+	state.setFan(false, readSoCTempC())
+	for {
+		time.Sleep(5 * time.Second)
+		t := readSoCTempC()
+		if t == 0 {
+			continue
+		}
+		if !fanOn && t >= onAt {
+			if err := setFan(true); err == nil {
+				fanOn = true
+				log.Printf("fan ON  at %d°C (>= %d)", t, onAt)
+			}
+		} else if fanOn && t <= offAt {
+			if err := setFan(false); err == nil {
+				fanOn = false
+				log.Printf("fan OFF at %d°C (<= %d)", t, offAt)
+			}
+		}
+		state.setFan(fanOn, t)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Shared state
 // -----------------------------------------------------------------------------
 
@@ -279,6 +415,21 @@ type State struct {
 	curMotor  MotorCmd
 	lastMotor time.Time
 	ntrip     NTRIPStatus
+	fanOn     bool
+	socTempC  int
+}
+
+func (s *State) setFan(on bool, tempC int) {
+	s.mu.Lock()
+	s.fanOn = on
+	s.socTempC = tempC
+	s.mu.Unlock()
+}
+
+func (s *State) getFan() (bool, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.fanOn, s.socTempC
 }
 
 func (s *State) setGGA(line string) {
@@ -333,6 +484,7 @@ func runNTRIP(cfg NTRIPConfig, getGGA func() string, out io.Writer, status func(
 	auth := base64.StdEncoding.EncodeToString([]byte(cfg.User + ":" + cfg.Pass))
 	for {
 		st.Connected = false
+		st.LastError = "" // clear stale error from previous session attempt
 		st.UpdatedUnix = time.Now().Unix()
 		status(st)
 
@@ -528,6 +680,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "GET  /api/streams    – RTSP URLs")
 	fmt.Fprintln(w, "POST /api/motor      – {speed:int, angular:int} (-100..100)")
 	fmt.Fprintln(w, "GET  /api/rtk/status – NTRIP/RTK status")
+	fmt.Fprintln(w, "GET  /api/fan        – fan + SoC temp; POST {\"on\":bool} for manual override")
 	fmt.Fprintln(w, "POST /api/imu/calibrate-mag/start  /  /end")
 }
 
@@ -557,10 +710,24 @@ func main() {
 	ntripUser := flag.String("ntrip-user", "", "NTRIP username")
 	ntripPass := flag.String("ntrip-pass", "", "NTRIP password")
 	gpsRateHz := flag.Int("gps-rate-hz", 0, "LC29H position fix rate (1..10, 0 = leave at chip default)")
+	fanOnAt := flag.Int("fan-on-temp", 65, "turn cooling fan on at this SoC temp (°C)")
+	fanOffAt := flag.Int("fan-off-temp", 55, "turn cooling fan off at this SoC temp (°C)")
+	withTailscaled := flag.Bool("with-tailscaled", false, "spawn /userdata/tailscaled as a detached child if not already running")
 	flag.Parse()
 
 	if *daemon {
 		daemonize(*logPath)
+	}
+
+	// Sync clock from HTTP Date header if our local time looks wrong.
+	// This must happen before NTRIP/HTTPS clients try to validate certs.
+	syncTimeFromHTTP()
+
+	// Spawn tailscaled as a detached child if requested. Doing this from Go
+	// (with SysProcAttr.Setsid) is reliable; doing it from the boot hook with
+	// `setsid X &` was unreliable on this distro.
+	if *withTailscaled {
+		spawnTailscaled("/userdata/tailscale", "/userdata/tailscale-state", "/tmp/tailscaled.sock", "/tmp/tailscaled.log")
 	}
 
 	state := &State{}
@@ -657,6 +824,9 @@ func main() {
 		}
 	}()
 
+	// Thermal fan control loop — keeps SoC at safe temp regardless of load.
+	go runThermalFanLoop(state, *fanOnAt, *fanOffAt)
+
 	// NTRIP client: only runs if creds are provided.
 	if *ntripHost != "" && *ntripUser != "" && *ntripPass != "" {
 		log.Printf("NTRIP enabled: %s:%d /%s as %s", *ntripHost, *ntripPort, *ntripMount, *ntripUser)
@@ -689,6 +859,35 @@ func main() {
 	})
 	mux.HandleFunc("/api/rtk/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, state.getNTRIP())
+	})
+	mux.HandleFunc("/api/fan", func(w http.ResponseWriter, r *http.Request) {
+		on, t := state.getFan()
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, 200, map[string]any{
+				"fan_on":      on,
+				"soc_temp_c":  t,
+				"on_at":       *fanOnAt,
+				"off_at":      *fanOffAt,
+			})
+		case http.MethodPost:
+			var req struct {
+				On *bool `json:"on"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.On == nil {
+				http.Error(w, "missing 'on' field", 400)
+				return
+			}
+			if err := setFan(*req.On); err != nil {
+				writeJSON(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+			state.setFan(*req.On, readSoCTempC())
+			writeJSON(w, 200, map[string]any{"fan_on": *req.On, "note": "auto-thermal loop will override after next tick"})
+		default:
+			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+		}
 	})
 	// Magnetometer calibration. Caller spins the robot ~360° between start and end.
 	var calSeq uint8

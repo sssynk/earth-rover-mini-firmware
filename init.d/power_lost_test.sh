@@ -12,9 +12,14 @@
 #
 # (Or run /userdata/restore_stock.sh which does the rm + tells you what to do.)
 
+# Source the vendor's library env so /oem/usr/bin/* binaries can find their
+# rockchip libs (librockchip_mpp.so.1, etc). When invoked from S99_auto_reboot,
+# the parent shell doesn't have these paths set, so /oem binaries fail to load.
+[ -f /etc/profile.d/RkEnv.sh ] && . /etc/profile.d/RkEnv.sh
+
 # Idempotent stop: kill the vendor app AND any previous instances of ours
 # (so re-running this script by hand doesn't pile up duplicate processes).
-killall frodobot.sh frodobot.bin robot_app sample_demo_dual_camera 2>/dev/null
+killall frodobot.sh frodobot.bin robot_app sample_demo_dual_camera tailscaled 2>/dev/null
 sleep 1
 
 # Camera demo: 4 RTSP streams at rtsp://<robot>:554/live/{0..3}
@@ -40,10 +45,19 @@ if [ -f /userdata/robot_app.env ]; then
 fi
 
 # Custom firmware: HTTP API, RTK pipeline (if env supplied), motor control.
+# Note: robot_app syncs the clock via HTTP Date header on startup before doing
+# anything cert-sensitive. Tailscaled (started below) needs that valid clock.
+# robot_app self-daemonizes (-daemon), syncs clock via HTTP, and spawns
+# tailscaled as a detached child (-with-tailscaled). Doing the tailscaled
+# spawn from inside Go (using SysProcAttr.Setsid) is reliable; doing it from
+# this shell script with `setsid X &` was not — the Go child would die when
+# the shell script exited despite all the usual detach incantations.
 /userdata/robot_app -daemon -log /tmp/robot.log \
     -listen :8080 \
     -allow-motor -max-speed 100 \
+    -with-tailscaled \
     $NTRIP_ARGS
+
 # NOTE: -gps-rate-hz N is implemented but the LC29H firmware on this unit
 # (LC29HDANR11A03S_RSA) only accepts $PAIR050,1000 (1 Hz). Higher rates are
 # rejected with error 2 (invalid parameter). See docs/gps-and-rtk.md.
