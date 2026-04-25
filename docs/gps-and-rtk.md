@@ -138,6 +138,29 @@ python3 ntrip.py | nc -q 1 127.0.0.1 9999
 
 You should see the chip's `$GNGGA` `fix_quality` field climb from 1 to 4 once it has corrections AND clear sky view. **Indoors it usually won't** — multipath kills carrier-phase tracking even with good RTCM.
 
+## Position update rate is locked to 1 Hz
+
+The LC29H *chip* is rated for up to 10 Hz output, but the firmware variant shipped on this unit (`LC29HDANR11A03S_RSA`, March 2024) appears to be **rate-locked to 1 Hz**. Tested against this hardware:
+
+| Command sent                            | Response                            | Result |
+|-----------------------------------------|-------------------------------------|--------|
+| `$PAIR050,1000*12`                       | `$PAIR001,050,0*3E`                 | OK (default 1 Hz) |
+| `$PAIR050,500*26` (2 Hz)                 | `$PAIR001,050,2*3C`                 | invalid parameter |
+| `$PAIR050,200*21` (5 Hz)                 | `$PAIR001,050,2*3C`                 | invalid parameter |
+| `$PAIR050,100*22` (10 Hz)                | `$PAIR001,050,2*3C`                 | invalid parameter |
+| `$PQTMCFGRATE,W,200*3D`                  | `$PQTMCFGRATE,ERROR,3*33`           | invalid value     |
+| `$PQTMCFGFIXRATE,W,200*6A`               | `$PQTMCFGFIXRATE,ERROR,1*66`        | unsupported cmd   |
+
+Best guess for why: dual-band L1/L5 + 5-constellation tracking + RTK convergence in this firmware probably exceeds the chip's per-fix compute budget at higher rates, so Quectel locked the rate config out. A different LC29H firmware (e.g., the LC29H-EA variant) may behave differently.
+
+If you need >1 Hz position output for autonomous nav, you have a few options:
+
+- **Interpolate** between fixes using the IMU on the STM32 (which streams at ~6 Hz already). Standard sensor-fusion approach.
+- **Cross-check Quectel's docs** for the specific firmware string above; there might be an undocumented unlock command or a different firmware revision.
+- **Replace the LC29H** with a module without the rate lock if you need raw 10 Hz GNSS.
+
+The `-gps-rate-hz N` flag in this firmware is wired up — it just sends `$PAIR050,<1000/N>*<cs>` on startup. If a future firmware accepts higher rates, the flag will Just Work. For now, leave it unset.
+
 ## Indoor reality check
 
 Single-point fix indoors is achievable thanks to L5 + multi-constellation. RTK indoors usually isn't. The pipeline still works — you just won't get a fixed solution until the antenna sees sky.

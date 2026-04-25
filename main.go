@@ -556,6 +556,7 @@ func main() {
 	ntripMount := flag.String("ntrip-mount", "AUTO", "NTRIP mountpoint")
 	ntripUser := flag.String("ntrip-user", "", "NTRIP username")
 	ntripPass := flag.String("ntrip-pass", "", "NTRIP password")
+	gpsRateHz := flag.Int("gps-rate-hz", 0, "LC29H position fix rate (1..10, 0 = leave at chip default)")
 	flag.Parse()
 
 	if *daemon {
@@ -581,6 +582,19 @@ func main() {
 
 	// Wake GNSS in case it's stopped
 	_, _ = gps.Write([]byte("$PQTMGNSSSTART*51\r\n"))
+
+	// Optional: change position fix rate via $PAIR050. 200ms = 5 Hz, 100ms = 10 Hz, etc.
+	if *gpsRateHz >= 1 && *gpsRateHz <= 10 {
+		interval := 1000 / *gpsRateHz
+		body := fmt.Sprintf("PAIR050,%d", interval)
+		var cs byte
+		for i := 0; i < len(body); i++ {
+			cs ^= body[i]
+		}
+		cmd := fmt.Sprintf("$%s*%02X\r\n", body, cs)
+		_, _ = gps.Write([]byte(cmd))
+		log.Printf("set GPS rate to %d Hz: %s", *gpsRateHz, strings.TrimSpace(cmd))
+	}
 
 	// STM32 reader
 	go func() {

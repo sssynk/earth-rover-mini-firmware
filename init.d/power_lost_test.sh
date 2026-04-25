@@ -44,3 +44,6 @@ fi
     -listen :8080 \
     -allow-motor -max-speed 100 \
     $NTRIP_ARGS
+# NOTE: -gps-rate-hz N is implemented but the LC29H firmware on this unit
+# (LC29HDANR11A03S_RSA) only accepts $PAIR050,1000 (1 Hz). Higher rates are
+# rejected with error 2 (invalid parameter). See docs/gps-and-rtk.md.
