@@ -195,6 +195,52 @@ func EncodeStateFrame(state, index uint8) []byte {
 	return buf.Bytes()
 }
 
+// runNetworkStatusLoop periodically probes external internet reachability
+// (TCP connect to 1.1.1.1:443 with a short timeout) and pushes the result
+// to the STM32's head/network LED via UCP_STATE messages. Only writes when
+// the state actually changes, so the STM32 isn't spammed.
+//
+// Manual POST /api/led/head calls still work — they'll be visible until the
+// next auto-probe (≤ probeEvery seconds) reasserts.
+func runNetworkStatusLoop(stm *os.File, probeEvery time.Duration) {
+	var seq uint8
+	var lastState uint8 = 255 // sentinel — guarantees first send
+
+	push := func(s uint8, name string) {
+		if s == lastState {
+			return
+		}
+		frame := EncodeStateFrame(s, seq)
+		seq++
+		if _, err := stm.Write(frame); err != nil {
+			log.Printf("net-led write: %v", err)
+			return
+		}
+		log.Printf("net-led: %s", name)
+		lastState = s
+	}
+
+	// Show "unknown" (red) until the first probe completes.
+	push(UCP_HEAD_UNKNOWN, "probing")
+
+	t := time.NewTicker(probeEvery)
+	defer t.Stop()
+	for {
+		ok := false
+		c, err := net.DialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
+		if err == nil {
+			ok = true
+			_ = c.Close()
+		}
+		if ok {
+			push(UCP_HEAD_CONNECTED, "connected (1.1.1.1:443 OK)")
+		} else {
+			push(UCP_HEAD_DISCONNECTED, "disconnected (1.1.1.1:443 fail)")
+		}
+		<-t.C
+	}
+}
+
 // parseHeadState accepts either a string ("connected"/"ota"/...) or a numeric
 // 0..4 from JSON and returns the UCP enum value plus the canonical name.
 func parseHeadState(v any) (uint8, string, bool) {
@@ -822,6 +868,8 @@ func main() {
 	fanOnAt := flag.Int("fan-on-temp", 65, "turn cooling fan on at this SoC temp (°C)")
 	fanOffAt := flag.Int("fan-off-temp", 55, "turn cooling fan off at this SoC temp (°C)")
 	withTailscaled := flag.Bool("with-tailscaled", false, "spawn /userdata/tailscaled as a detached child if not already running")
+	netStatusLED := flag.Bool("net-status-led", true, "auto-drive head LED based on internet reachability (TCP 1.1.1.1:443)")
+	netStatusEvery := flag.Duration("net-status-interval", 5*time.Second, "how often to probe internet for the head LED")
 	flag.Parse()
 
 	if *daemon {
@@ -939,6 +987,11 @@ func main() {
 
 	// Thermal fan control loop — keeps SoC at safe temp regardless of load.
 	go runThermalFanLoop(state, *fanOnAt, *fanOffAt)
+
+	// Auto-drive the head LED from internet reachability.
+	if *netStatusLED {
+		go runNetworkStatusLoop(stm, *netStatusEvery)
+	}
 
 	// NTRIP client: only runs if creds are provided.
 	if *ntripHost != "" && *ntripUser != "" && *ntripPass != "" {
