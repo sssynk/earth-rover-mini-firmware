@@ -161,6 +161,95 @@ func EncodeIMUCorrect(end bool, calType, index uint8) []byte {
 	return buf.Bytes()
 }
 
+// UCP_STATE message values (see ucp.h's ucp_state_e enum). The STM32 uses
+// these to drive the head/network status LED on its WS2812 chain:
+//   0 UNKNOWN        → solid red
+//   1 SIMABSENT      → red slow blink
+//   2 DISCONNECTED   → green fast blink
+//   3 CONNECTED      → solid green
+//   4 OTA_ING        → blue fast blink
+const (
+	UCP_HEAD_UNKNOWN      = 0
+	UCP_HEAD_SIMABSENT    = 1
+	UCP_HEAD_DISCONNECTED = 2
+	UCP_HEAD_CONNECTED    = 3
+	UCP_HEAD_OTA          = 4
+)
+
+// StateCmd is the UCP_STATE message body (5 bytes total: 4 hd + 1 state).
+type StateCmd struct {
+	Len   uint16
+	ID    uint8
+	Index uint8
+	State uint8
+}
+
+// EncodeStateFrame builds a UCP_STATE wire frame (sync 2 + struct 5 + crc 2 = 9 bytes).
+func EncodeStateFrame(state, index uint8) []byte {
+	m := StateCmd{Len: 5, ID: UCP_STATE, Index: index, State: state}
+	var buf bytes.Buffer
+	buf.Write(ucpSync)
+	binary.Write(&buf, binary.LittleEndian, &m)
+	crc := crc16Modbus(buf.Bytes())
+	binary.Write(&buf, binary.LittleEndian, crc)
+	return buf.Bytes()
+}
+
+// parseHeadState accepts either a string ("connected"/"ota"/...) or a numeric
+// 0..4 from JSON and returns the UCP enum value plus the canonical name.
+func parseHeadState(v any) (uint8, string, bool) {
+	switch x := v.(type) {
+	case string:
+		switch strings.ToLower(x) {
+		case "unknown":
+			return UCP_HEAD_UNKNOWN, "unknown", true
+		case "simabsent", "no-sim", "nosim":
+			return UCP_HEAD_SIMABSENT, "simabsent", true
+		case "disconnected", "connecting":
+			return UCP_HEAD_DISCONNECTED, "disconnected", true
+		case "connected", "online", "ok":
+			return UCP_HEAD_CONNECTED, "connected", true
+		case "ota", "updating":
+			return UCP_HEAD_OTA, "ota", true
+		}
+	case float64:
+		n := int(x)
+		if n >= 0 && n <= 4 {
+			names := []string{"unknown", "simabsent", "disconnected", "connected", "ota"}
+			return uint8(n), names[n], true
+		}
+	}
+	return 0, "", false
+}
+
+// clampInt16 saturates a JSON-decoded int into the int16 range without panic.
+func clampInt16(v int) int16 {
+	if v > 32767 {
+		return 32767
+	}
+	if v < -32768 {
+		return -32768
+	}
+	return int16(v)
+}
+
+// findStatusLED returns (brightnessPath, maxBrightnessPath) for the status
+// LED, trying the symlinked led-class path first and falling back to the
+// platform device tree path observed in frodobot.bin's strings.
+func findStatusLED() (string, string) {
+	candidates := [][2]string{
+		{"/sys/class/leds/status/brightness", "/sys/class/leds/status/max_brightness"},
+		{"/sys/devices/platform/frodobots/gpioleds/status/brightness",
+			"/sys/devices/platform/frodobots/gpioleds/status/max_brightness"},
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c[0]); err == nil {
+			return c[0], c[1]
+		}
+	}
+	return "", ""
+}
+
 var ucpSync = []byte{0xfd, 0xff}
 
 // crc16Modbus: init 0xFFFF, poly 0xA001 (matches move.cpp lookup tables).
@@ -417,6 +506,23 @@ type State struct {
 	ntrip     NTRIPStatus
 	fanOn     bool
 	socTempC  int
+	// Headlight values, sent in every motor frame. Don't decay with the motor
+	// watchdog — once you set them they stay until changed.
+	frontLED int16
+	backLED  int16
+}
+
+func (s *State) setLEDs(front, back int16) {
+	s.mu.Lock()
+	s.frontLED = front
+	s.backLED = back
+	s.mu.Unlock()
+}
+
+func (s *State) getLEDs() (int16, int16) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.frontLED, s.backLED
 }
 
 func (s *State) setFan(on bool, tempC int) {
@@ -682,6 +788,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "GET  /api/rtk/status – NTRIP/RTK status")
 	fmt.Fprintln(w, "GET  /api/fan        – fan + SoC temp; POST {\"on\":bool} for manual override")
 	fmt.Fprintln(w, "POST /api/imu/calibrate-mag/start  /  /end")
+	fmt.Fprintln(w, "GET  /api/led/cars   – headlight values; POST {\"front\":int,\"back\":int}")
+	fmt.Fprintln(w, "POST /api/led/head   – {\"state\":\"connected|disconnected|...|ota\"}")
+	fmt.Fprintln(w, "GET  /api/led/status – kernel gpio-led; POST {\"value\":int}")
 }
 
 // -----------------------------------------------------------------------------
@@ -776,7 +885,8 @@ func main() {
 		log.Printf("STM32 reader exited: %v", err)
 	}()
 
-	// STM32 motor writer (10Hz, watchdog-driven)
+	// STM32 motor writer (10Hz, watchdog-driven). Also carries the headlight
+	// values from setLEDs() so /api/led/cars works without a second writer.
 	go func() {
 		var seq uint8
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -786,6 +896,9 @@ func main() {
 			if !*allowMotor {
 				continue // never write motor frames in safe mode
 			}
+			front, back := state.getLEDs()
+			cmd.FrontLED = front
+			cmd.BackLED = back
 			cmd.Index = seq
 			seq++
 			if _, err := stm.Write(cmd.EncodeFrame()); err != nil {
@@ -925,6 +1038,120 @@ func main() {
 			"next": "watch /api/telemetry — Heading and Mag values should be re-zeroed",
 		})
 	})
+
+	// ----- LEDs -----------------------------------------------------------
+	// Three independent outputs:
+	//   /api/led/cars   → headlight & taillight (UCP MOTOR_CTL.front_led/back_led)
+	//   /api/led/head   → STM32 WS2812 status LED via UCP_STATE message
+	//   /api/led/status → kernel gpio-led at /sys/class/leds/status
+
+	// Headlight & taillight values. Stored in shared state; sent in every
+	// motor frame by the writer goroutine. Range/semantics aren't documented
+	// in the public source — we pass through int16 verbatim and let the
+	// vendor STM32 firmware interpret. Values that worked in frodobot.bin
+	// (which we know it controlled live) are likely 0=off, nonzero=on, with
+	// brightness possibly scaling at higher values.
+	mux.HandleFunc("/api/led/cars", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			f, b := state.getLEDs()
+			writeJSON(w, 200, map[string]any{"front": f, "back": b})
+		case http.MethodPost:
+			var req struct {
+				Front *int `json:"front"`
+				Back  *int `json:"back"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json: "+err.Error(), 400)
+				return
+			}
+			cf, cb := state.getLEDs()
+			if req.Front != nil {
+				cf = clampInt16(*req.Front)
+			}
+			if req.Back != nil {
+				cb = clampInt16(*req.Back)
+			}
+			state.setLEDs(cf, cb)
+			writeJSON(w, 200, map[string]any{
+				"front": cf, "back": cb,
+				"note": "values applied on next motor frame (~100ms)",
+			})
+		default:
+			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Head/network status LED on the STM32 WS2812 chain.
+	// Body: {"state": "unknown"|"simabsent"|"disconnected"|"connected"|"ota"} or numeric 0..4
+	var headSeq uint8
+	mux.HandleFunc("/api/led/head", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			State any `json:"state"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json: "+err.Error(), 400)
+			return
+		}
+		s, name, ok := parseHeadState(req.State)
+		if !ok {
+			http.Error(w, `state must be one of: unknown|simabsent|disconnected|connected|ota (or 0..4)`, 400)
+			return
+		}
+		frame := EncodeStateFrame(s, headSeq)
+		headSeq++
+		if _, err := stm.Write(frame); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"sent":  fmt.Sprintf("UCP_STATE state=%d (%s)", s, name),
+			"hex":   fmt.Sprintf("%x", frame),
+			"note":  "STM32 firmware may or may not parse UCP_STATE — depends on shipping fw vs published source",
+		})
+	})
+
+	// Kernel-class GPIO "status" LED. Auto-detect path the first time we
+	// touch it (could be /sys/class/leds/status/ or the platform DT path).
+	mux.HandleFunc("/api/led/status", func(w http.ResponseWriter, r *http.Request) {
+		brightness, max := findStatusLED()
+		if brightness == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "no status LED found at /sys/class/leds/status or /sys/devices/platform/frodobots/gpioleds/status",
+			})
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			cur, _ := os.ReadFile(brightness)
+			mb, _ := os.ReadFile(max)
+			writeJSON(w, 200, map[string]any{
+				"value":          strings.TrimSpace(string(cur)),
+				"max_brightness": strings.TrimSpace(string(mb)),
+				"path":           brightness,
+			})
+		case http.MethodPost:
+			var req struct {
+				Value *int `json:"value"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Value == nil {
+				http.Error(w, "expected {\"value\":int}", 400)
+				return
+			}
+			if err := os.WriteFile(brightness, []byte(strconv.Itoa(*req.Value)), 0644); err != nil {
+				writeJSON(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, 200, map[string]any{"value": *req.Value, "path": brightness})
+		default:
+			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+		}
+	})
+
 	mux.HandleFunc("/api/streams", func(w http.ResponseWriter, r *http.Request) {
 		host, _, _ := strings.Cut(r.Host, ":")
 		if host == "" {
