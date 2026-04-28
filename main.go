@@ -412,6 +412,10 @@ func readUCPFrames(r io.Reader, handler func(id, index uint8, body []byte)) erro
 // -----------------------------------------------------------------------------
 
 // GPSFix is the parsed view of the latest $GxGGA + $GxRMC.
+//
+// Position / quality fields come from $GxGGA. Course-over-ground and speed
+// come from $GxRMC. The two NMEA sentences arrive on different lines but at
+// the same 1 Hz cadence, and we merge them into one struct as they come in.
 type GPSFix struct {
 	Time        string  `json:"time_utc"`
 	Lat         float64 `json:"lat"`
@@ -422,6 +426,13 @@ type GPSFix struct {
 	HDOP        float64 `json:"hdop"`
 	Valid       bool    `json:"valid"`
 	UpdatedUnix int64   `json:"updated_unix"`
+	// Course-over-ground (true north degrees) and speed-over-ground (m/s)
+	// from $GxRMC. CourseDeg is direction of motion, NOT direction of facing
+	// — going in reverse means CourseDeg is 180° off from "where the robot
+	// points". Reliable when SpeedMps > ~0.3; below that the receiver may
+	// emit stale or noise values.
+	CourseDeg float64 `json:"course_deg"`
+	SpeedMps  float64 `json:"speed_mps"`
 }
 
 // parseNMEAGGA parses a $GxGGA sentence into a GPSFix (partially).
@@ -447,6 +458,30 @@ func parseNMEAGGA(line string) (GPSFix, bool) {
 	fix.AltM, _ = strconv.ParseFloat(parts[9], 64)
 	fix.Valid = fix.FixQuality > 0
 	return fix, true
+}
+
+// parseNMEARMC parses a $GxRMC sentence and returns (course_deg, speed_mps, ok).
+// Layout: $GxRMC,hhmmss.sss,A/V,lat,N/S,lon,E/W,speed_kn,course_deg_true,date,...
+// The status field 'A' = active/valid, 'V' = void; we drop 'V' frames since
+// COG/speed are unreliable then. NMEA reports speed in knots, we convert to m/s.
+func parseNMEARMC(line string) (float64, float64, bool) {
+	if !strings.HasPrefix(line, "$") {
+		return 0, 0, false
+	}
+	parts := strings.Split(line, ",")
+	if len(parts) < 9 || !strings.HasSuffix(parts[0], "RMC") {
+		return 0, 0, false
+	}
+	if parts[2] != "A" { // V = void / position invalid
+		return 0, 0, false
+	}
+	speedKn, err1 := strconv.ParseFloat(parts[7], 64)
+	courseDeg, err2 := strconv.ParseFloat(parts[8], 64)
+	if err1 != nil && err2 != nil {
+		return 0, 0, false
+	}
+	const knToMps = 0.514444
+	return courseDeg, speedKn * knToMps, true
 }
 
 // nmeaToDeg converts "DDMM.MMMM" + "N/S/E/W" to signed decimal degrees.
@@ -768,7 +803,25 @@ func (s *State) getTelemetry() (Telemetry, bool) {
 func (s *State) setGPS(g GPSFix) {
 	g.UpdatedUnix = time.Now().Unix()
 	s.mu.Lock()
+	// Preserve course/speed from a recent RMC if THIS GGA has a valid fix.
+	// If fix is invalid, drop them so consumers don't get stuck reading
+	// stale COG/speed from minutes ago when we last had a lock.
+	if g.Valid {
+		g.CourseDeg = s.gps.CourseDeg
+		g.SpeedMps = s.gps.SpeedMps
+	}
 	s.gps = g
+	s.gpsOK = true
+	s.mu.Unlock()
+}
+
+// setCOG updates only course-over-ground and speed (from $GxRMC). Doesn't
+// touch lat/lon/altitude/fix-quality — those came from the most recent GGA.
+func (s *State) setCOG(courseDeg, speedMps float64) {
+	s.mu.Lock()
+	s.gps.CourseDeg = courseDeg
+	s.gps.SpeedMps = speedMps
+	s.gps.UpdatedUnix = time.Now().Unix()
 	s.gpsOK = true
 	s.mu.Unlock()
 }
@@ -975,6 +1028,10 @@ func main() {
 						state.setGGA(ln)
 						if fix, ok := parseNMEAGGA(ln); ok {
 							state.setGPS(fix)
+						}
+					} else if strings.Contains(ln, "RMC") {
+						if cog, mps, ok := parseNMEARMC(ln); ok {
+							state.setCOG(cog, mps)
 						}
 					}
 					line = line[:0]
